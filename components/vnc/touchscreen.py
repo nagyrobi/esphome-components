@@ -1,12 +1,11 @@
 import esphome.codegen as cg
+from esphome.components import touchscreen
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
 
-from esphome.components import touchscreen
-from . import VNCDisplay, CONF_VNC_ID, vnc_ns
+from . import CONF_VNC_ID, VNCDisplay, vnc_ns
 
 VNCTouchscreen = vnc_ns.class_("VNCTouchscreen", touchscreen.Touchscreen)
-
 
 CONFIG_SCHEMA = touchscreen.TOUCHSCREEN_SCHEMA.extend(
     {
