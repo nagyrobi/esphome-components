@@ -150,6 +150,25 @@ static inline bool buf_add(circ_buf_t &buf, const uint8_t *src, size_t len) {
   return true;
 }
 
+/// 5- and 6-bit to 8-bit channel expansion, precomputed so the RGB565 conversion below
+/// matches display::ColorUtil::to_color() exactly without doing integer division per pixel.
+struct Rgb565Lut {
+  uint8_t five[32];
+  uint8_t six[64];
+  constexpr Rgb565Lut() : five(), six() {
+    for (int i = 0; i != 32; i++)
+      five[i] = (uint8_t) (255 * i / 31);
+    for (int i = 0; i != 64; i++)
+      six[i] = (uint8_t) (255 * i / 63);
+  }
+};
+static constexpr Rgb565Lut RGB565_LUT{};
+
+/// Pack a colour into the framebuffer's B, G, R, X word.
+static inline uint32_t pack_pixel(uint8_t r, uint8_t g, uint8_t b) {
+  return (uint32_t) b | ((uint32_t) g << 8) | ((uint32_t) r << 16);
+}
+
 class VNCDisplay;
 
 class VNCTrigger : public Trigger<>, public Parented<VNCDisplay> {
@@ -299,11 +318,10 @@ class VNCDisplay : public display::Display {
   void draw_pixel_at(int x, int y, Color color) override {
     if (x < 0 || y < 0 || x >= this->width_ || y >= this->height_)
       return;
-    uint8_t *dst = this->display_buffer_ + ((size_t) y * this->width_ + x) * PIXEL_BYTES;
-    dst[0] = color.b;
-    dst[1] = color.g;
-    dst[2] = color.r;
-    dst[3] = 0;
+    // A single 32 bit store: byte-wide writes to PSRAM are read-modify-write and cost
+    // four times as many bus transactions.
+    uint32_t px = pack_pixel(color.r, color.g, color.b);
+    memcpy(this->pixel_ptr_(x, y), &px, PIXEL_BYTES);
     if (!this->internal_update_)
       this->mark_dirty_(x, y, 1, 1);
   }
@@ -313,15 +331,10 @@ class VNCDisplay : public display::Display {
   void fill(Color color) override {
     if (this->display_buffer_ == nullptr)
       return;
-    const uint8_t pixel[PIXEL_BYTES] = {color.b, color.g, color.r, 0};
+    uint32_t px = pack_pixel(color.r, color.g, color.b);
     size_t count = (size_t) this->width_ * this->height_;
-    uint8_t *dst = this->display_buffer_;
-    if (pixel[0] == pixel[1] && pixel[1] == pixel[2] && pixel[2] == pixel[3]) {
-      memset(dst, pixel[0], count * PIXEL_BYTES);
-    } else {
-      for (size_t i = 0; i != count; i++, dst += PIXEL_BYTES)
-        memcpy(dst, pixel, PIXEL_BYTES);
-    }
+    auto *dst = reinterpret_cast<uint32_t *>(this->display_buffer_);
+    std::fill_n(dst, count, px);
     if (!this->internal_update_)
       this->mark_dirty_(0, 0, this->width_, this->height_);
   }
@@ -330,29 +343,51 @@ class VNCDisplay : public display::Display {
                       display::ColorBitness bitness, bool big_endian, int x_offset, int y_offset, int x_pad) override {
     if (w <= 0 || h <= 0 || x_start < 0 || y_start < 0 || x_start + w > this->width_ || y_start + h > this->height_)
       return;
-    // COLOR_BITNESS_888 is three bytes per pixel. With little-endian byte order and COLOR_ORDER_RGB
-    // those bytes are already B, G, R - the same channel order as the framebuffer - so the copy is a
-    // plain 3 -> 4 byte expansion. Everything else (rotation, 565/332, byte swapping, other channel
-    // orders) is handed to the generic per-pixel implementation, which converts via draw_pixel_at().
-    if (this->rotation_ != display::DISPLAY_ROTATION_0_DEGREES || bitness != display::COLOR_BITNESS_888 || big_endian ||
-        order != display::COLOR_ORDER_RGB) {
+    const size_t src_pixels = (size_t) (w + x_offset + x_pad);
+    bool handled = false;
+
+    if (this->rotation_ == display::DISPLAY_ROTATION_0_DEGREES && order == display::COLOR_ORDER_RGB) {
+      if (bitness == display::COLOR_BITNESS_565) {
+        // This is the path LVGL takes at color_depth: 16. The generic implementation below costs
+        // three integer divides, a Color construction and a virtual draw_pixel_at() per pixel;
+        // a table lookup plus one 32 bit store is an order of magnitude cheaper, which matters a
+        // lot on a 480x480 panel sharing PSRAM bandwidth with an RGB LCD.
+        for (int y = 0; y != h; y++) {
+          const uint8_t *src = ptr + ((size_t) (y + y_offset) * src_pixels + x_offset) * 2;
+          uint8_t *dst = this->pixel_ptr_(x_start, y + y_start);
+          for (int x = 0; x != w; x++, src += 2, dst += PIXEL_BYTES) {
+            uint16_t c = big_endian ? (uint16_t) ((src[0] << 8) | src[1]) : (uint16_t) ((src[1] << 8) | src[0]);
+            uint32_t px = pack_pixel(RGB565_LUT.five[(c >> 11) & 0x1F], RGB565_LUT.six[(c >> 5) & 0x3F],
+                                     RGB565_LUT.five[c & 0x1F]);
+            memcpy(dst, &px, PIXEL_BYTES);
+          }
+        }
+        handled = true;
+      } else if (bitness == display::COLOR_BITNESS_888 && !big_endian) {
+        // COLOR_BITNESS_888 is three bytes per pixel; little-endian RGB puts them in B, G, R
+        // order, which is the framebuffer's own order, so this is a 3 -> 4 byte expansion.
+        for (int y = 0; y != h; y++) {
+          const uint8_t *src = ptr + ((size_t) (y + y_offset) * src_pixels + x_offset) * 3;
+          uint8_t *dst = this->pixel_ptr_(x_start, y + y_start);
+          for (int x = 0; x != w; x++, src += 3, dst += PIXEL_BYTES) {
+            uint32_t px = (uint32_t) src[0] | ((uint32_t) src[1] << 8) | ((uint32_t) src[2] << 16);
+            memcpy(dst, &px, PIXEL_BYTES);
+          }
+        }
+        handled = true;
+      }
+    }
+
+    if (!handled) {
+      // Rotation, 332, or a channel order we do not special-case: let the base class convert
+      // pixel by pixel. internal_update_ suppresses per-pixel dirty marking, since the whole
+      // rectangle is queued below anyway.
       this->internal_update_ = true;
       display::Display::draw_pixels_at(x_start, y_start, w, h, ptr, order, bitness, big_endian, x_offset, y_offset,
                                        x_pad);
       this->internal_update_ = false;
-    } else {
-      const size_t src_stride = (size_t) (w + x_offset + x_pad) * 3;
-      for (int y = 0; y != h; y++) {
-        const uint8_t *src = ptr + (size_t) (y + y_offset) * src_stride + (size_t) x_offset * 3;
-        uint8_t *dst = this->display_buffer_ + ((size_t) (y + y_start) * this->width_ + x_start) * PIXEL_BYTES;
-        for (int x = 0; x != w; x++, src += 3, dst += PIXEL_BYTES) {
-          dst[0] = src[0];
-          dst[1] = src[1];
-          dst[2] = src[2];
-          dst[3] = 0;
-        }
-      }
     }
+
     // Push this rectangle straight to the transmit task; fall back to the coalesced dirty
     // rectangle if the queue is full, so nothing is ever silently dropped.
     if (this->state_ == STATE_READY) {
@@ -365,6 +400,10 @@ class VNCDisplay : public display::Display {
   }
 
  protected:
+  inline uint8_t *pixel_ptr_(int x, int y) {
+    return this->display_buffer_ + ((size_t) y * this->width_ + x) * PIXEL_BYTES;
+  }
+
   int get_height_internal() override { return this->height_; }
   int get_width_internal() override { return this->width_; }
 
@@ -431,7 +470,6 @@ class VNCDisplay : public display::Display {
     this->state_ = STATE_VERSION;
     buf_clr(this->inq_);
     this->skip_bytes_ = 0;
-    this->high_freq_.start();
     ESP_LOGD(TAG, "Client connected");
     if (this->write_(RFB_MAGIC, sizeof RFB_MAGIC) < 0)
       this->disconnect_pending_ = true;
@@ -455,7 +493,6 @@ class VNCDisplay : public display::Display {
     this->mark_clean_();
     if (!was_connected)
       return;
-    this->high_freq_.stop();
     ESP_LOGD(TAG, "Client disconnected");
     if (this->on_disconnect_ != nullptr)
       this->defer([this]() { this->on_disconnect_(); });
@@ -849,7 +886,6 @@ class VNCDisplay : public display::Display {
   size_t tx_buflen_{0};
 
   CallbackManager<void(bool, uint16_t, uint16_t)> touchscreens_;
-  HighFrequencyLoopRequester high_freq_;
   std::function<void()> on_connect_{};
   std::function<void()> on_disconnect_{};
 
