@@ -470,7 +470,6 @@ class VNCDisplay : public display::Display {
     this->state_ = STATE_VERSION;
     buf_clr(this->inq_);
     this->skip_bytes_ = 0;
-    this->high_freq_.start();
     ESP_LOGD(TAG, "Client connected");
     if (this->write_(RFB_MAGIC, sizeof RFB_MAGIC) < 0)
       this->disconnect_pending_ = true;
@@ -494,7 +493,6 @@ class VNCDisplay : public display::Display {
     this->mark_clean_();
     if (!was_connected)
       return;
-    this->high_freq_.stop();
     ESP_LOGD(TAG, "Client disconnected");
     if (this->on_disconnect_ != nullptr)
       this->defer([this]() { this->on_disconnect_(); });
@@ -888,7 +886,6 @@ class VNCDisplay : public display::Display {
   size_t tx_buflen_{0};
 
   CallbackManager<void(bool, uint16_t, uint16_t)> touchscreens_;
-  HighFrequencyLoopRequester high_freq_;
   std::function<void()> on_connect_{};
   std::function<void()> on_disconnect_{};
 
