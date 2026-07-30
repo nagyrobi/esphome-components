@@ -9,6 +9,7 @@ from esphome.const import (
     CONF_LAMBDA,
     CONF_ON_CONNECT,
     CONF_ON_DISCONNECT,
+    CONF_PASSWORD,
     CONF_PORT,
     CONF_TRIGGER_ID,
     CONF_WIDTH,
@@ -24,6 +25,22 @@ AUTO_LOAD = ["socket", "touchscreen"]
 
 # The transmit task needs FreeRTOS or pthreads.
 SUPPORTED_PLATFORMS = [PLATFORM_ESP32, PLATFORM_HOST]
+
+
+def _validate_password(value):
+    """RFB VNC Authentication derives a single DES key from the password, so only the
+    first eight bytes are significant and clients disagree on non-ASCII encodings."""
+    value = cv.string_strict(value)
+    if not 1 <= len(value) <= 8:
+        raise cv.Invalid(
+            f"password must be between 1 and 8 characters (got {len(value)}) - the RFB "
+            "authentication scheme derives a DES key from it and ignores the rest"
+        )
+    if not value.isascii():
+        raise cv.Invalid(
+            "password must be ASCII - clients do not agree on other encodings"
+        )
+    return value
 
 
 def _consume_vnc_sockets(config):
@@ -46,6 +63,7 @@ CONFIG_SCHEMA = cv.All(
         {
             cv.GenerateID(): cv.declare_id(VNCDisplay),
             cv.Optional(CONF_PORT, default=5900): cv.port,
+            cv.Optional(CONF_PASSWORD): cv.sensitive(_validate_password),
             cv.Required(CONF_DIMENSIONS): cv.Any(
                 cv.dimensions,
                 cv.Schema(
@@ -88,6 +106,8 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await display.register_display(var, config)
     cg.add(var.set_port(config[CONF_PORT]))
+    if (password := config.get(CONF_PASSWORD)) is not None:
+        cg.add(var.set_password(password))
 
     if lambconf := config.get(CONF_LAMBDA):
         lambda_ = await cg.process_lambda(
