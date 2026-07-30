@@ -258,9 +258,24 @@ void VNCDisplay::fill(Color color) {
 
 void VNCDisplay::draw_pixels_at(int x_start, int y_start, int w, int h, const uint8_t *ptr, display::ColorOrder order,
                                 display::ColorBitness bitness, bool big_endian, int x_offset, int y_offset, int x_pad) {
-  if (w <= 0 || h <= 0 || x_start < 0 || y_start < 0 || x_start + w > this->width_ || y_start + h > this->height_)
+  if (w <= 0 || h <= 0)
     return;
-  const size_t src_pixels = (size_t) (w + x_offset + x_pad);
+  // Clip to the framebuffer instead of dropping the update. LVGL's software rotation pads the
+  // rotated width up to draw_rounding, so any invalidated area reaching the far edge arrives up
+  // to draw_rounding - 1 pixels too wide. Display::draw_pixels_at() clips per pixel and the
+  // esp_lcd based drivers let IDF clip for them, so a hard reject here loses updates that every
+  // other display shows.
+  const size_t src_stride = (size_t) (w + x_offset + x_pad);
+  const int clip_left = std::max(-x_start, 0);
+  const int clip_top = std::max(-y_start, 0);
+  const int dst_x = x_start + clip_left;
+  const int dst_y = y_start + clip_top;
+  const int cw = std::min(w - clip_left, this->width_ - dst_x);
+  const int ch = std::min(h - clip_top, this->height_ - dst_y);
+  if (cw <= 0 || ch <= 0)
+    return;
+  const int src_x = x_offset + clip_left;
+  const int src_y = y_offset + clip_top;
   bool handled = false;
 
   if (this->rotation_ == display::DISPLAY_ROTATION_0_DEGREES && order == display::COLOR_ORDER_RGB) {
@@ -269,10 +284,10 @@ void VNCDisplay::draw_pixels_at(int x_start, int y_start, int w, int h, const ui
       // three integer divides, a Color construction and a virtual draw_pixel_at() per pixel;
       // a table lookup plus one 32 bit store is an order of magnitude cheaper, which matters a
       // lot on a 480x480 panel sharing PSRAM bandwidth with an RGB LCD.
-      for (int y = 0; y != h; y++) {
-        const uint8_t *src = ptr + ((size_t) (y + y_offset) * src_pixels + x_offset) * 2;
-        uint8_t *dst = this->pixel_ptr_(x_start, y + y_start);
-        for (int x = 0; x != w; x++, src += 2, dst += PIXEL_BYTES) {
+      for (int y = 0; y != ch; y++) {
+        const uint8_t *src = ptr + ((size_t) (y + src_y) * src_stride + src_x) * 2;
+        uint8_t *dst = this->pixel_ptr_(dst_x, y + dst_y);
+        for (int x = 0; x != cw; x++, src += 2, dst += PIXEL_BYTES) {
           uint16_t c = big_endian ? (uint16_t) ((src[0] << 8) | src[1]) : (uint16_t) ((src[1] << 8) | src[0]);
           uint32_t px =
               pack_pixel(RGB565_LUT.five[(c >> 11) & 0x1F], RGB565_LUT.six[(c >> 5) & 0x3F], RGB565_LUT.five[c & 0x1F]);
@@ -283,10 +298,10 @@ void VNCDisplay::draw_pixels_at(int x_start, int y_start, int w, int h, const ui
     } else if (bitness == display::COLOR_BITNESS_888 && !big_endian) {
       // COLOR_BITNESS_888 is three bytes per pixel; little-endian RGB puts them in B, G, R
       // order, which is the framebuffer's own order, so this is a 3 -> 4 byte expansion.
-      for (int y = 0; y != h; y++) {
-        const uint8_t *src = ptr + ((size_t) (y + y_offset) * src_pixels + x_offset) * 3;
-        uint8_t *dst = this->pixel_ptr_(x_start, y + y_start);
-        for (int x = 0; x != w; x++, src += 3, dst += PIXEL_BYTES) {
+      for (int y = 0; y != ch; y++) {
+        const uint8_t *src = ptr + ((size_t) (y + src_y) * src_stride + src_x) * 3;
+        uint8_t *dst = this->pixel_ptr_(dst_x, y + dst_y);
+        for (int x = 0; x != cw; x++, src += 3, dst += PIXEL_BYTES) {
           uint32_t px = (uint32_t) src[0] | ((uint32_t) src[1] << 8) | ((uint32_t) src[2] << 16);
           memcpy(dst, &px, PIXEL_BYTES);
         }
@@ -297,22 +312,22 @@ void VNCDisplay::draw_pixels_at(int x_start, int y_start, int w, int h, const ui
 
   if (!handled) {
     // Rotation, 332, or a channel order we do not special-case: let the base class convert
-    // pixel by pixel. internal_update_ suppresses per-pixel dirty marking, since the whole
-    // rectangle is queued below anyway.
+    // pixel by pixel. It clips per pixel, so it gets the unclipped rectangle. internal_update_
+    // suppresses per-pixel dirty marking, since the whole rectangle is queued below anyway.
     this->internal_update_ = true;
     display::Display::draw_pixels_at(x_start, y_start, w, h, ptr, order, bitness, big_endian, x_offset, y_offset,
                                      x_pad);
     this->internal_update_ = false;
   }
 
-  // Push this rectangle straight to the transmit task; fall back to the coalesced dirty
-  // rectangle if the queue is full, so nothing is ever silently dropped.
+  // Queue the clipped rectangle - send_framebuffer_() copies straight out of the framebuffer,
+  // so an out-of-range rectangle would read past the end of it and desync the RFB stream.
   if (this->state_ == STATE_READY) {
-    rect_t r{(int16_t) x_start, (int16_t) y_start, (int16_t) (x_start + w - 1), (int16_t) (y_start + h - 1)};
+    rect_t r{(int16_t) dst_x, (int16_t) dst_y, (int16_t) (dst_x + cw - 1), (int16_t) (dst_y + ch - 1)};
     if (!this->queue_rect_(r))
-      this->mark_dirty_(x_start, y_start, w, h);
+      this->mark_dirty_(dst_x, dst_y, cw, ch);
   } else {
-    this->mark_dirty_(x_start, y_start, w, h);
+    this->mark_dirty_(dst_x, dst_y, cw, ch);
   }
 }
 
