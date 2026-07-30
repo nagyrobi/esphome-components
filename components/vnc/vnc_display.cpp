@@ -73,6 +73,24 @@ static inline uint32_t get32_be(const uint8_t *buf) {
   return buf[3] + (buf[2] << 8) + (buf[1] << 16) + ((uint32_t) buf[0] << 24);
 }
 
+/// True for the errnos that just mean the peer went away. A VNC client closing mid-stream
+/// almost always has unread framebuffer data buffered, and TCP requires it to answer with RST
+/// in that case, so ECONNRESET here is the normal way a session ends rather than a fault.
+static inline bool errno_is_disconnect() {
+  switch (errno) {
+    case ECONNRESET:
+    case ECONNABORTED:
+    case ENOTCONN:
+    case EPIPE:
+#ifdef ESHUTDOWN
+    case ESHUTDOWN:
+#endif
+      return true;
+    default:
+      return false;
+  }
+}
+
 static inline void buf_clr(circ_buf_t &buf) {
   buf.inp = 0;
   buf.outp = 0;
@@ -460,7 +478,11 @@ ssize_t VNCDisplay::read_(uint8_t *buffer, size_t len) {
   }
   if (errno == EAGAIN || errno == EWOULDBLOCK)
     return 0;
-  ESP_LOGW(TAG, "Socket read failed: errno %d", errno);
+  if (errno_is_disconnect()) {
+    ESP_LOGD(TAG, "Connection closed by peer while reading (errno %d)", errno);
+  } else {
+    ESP_LOGW(TAG, "Socket read failed: errno %d", errno);
+  }
   this->disconnect_pending_ = true;
   return -1;
 }
@@ -488,7 +510,11 @@ ssize_t VNCDisplay::write_(const uint8_t *buffer, size_t len) {
         delay(1);
         continue;
       }
-      ESP_LOGW(TAG, "Socket write failed: errno %d", errno);
+      if (errno_is_disconnect()) {
+        ESP_LOGD(TAG, "Connection closed by peer while writing (errno %d)", errno);
+      } else {
+        ESP_LOGW(TAG, "Socket write failed: errno %d", errno);
+      }
       this->disconnect_pending_ = true;
       return -1;
     }
@@ -519,22 +545,25 @@ void VNCDisplay::tx_16(uint16_t value) {
   this->tx_buflen_ += 2;
 }
 
-void VNCDisplay::tx_flush_() {
-  if (this->tx_buflen_ != 0) {
-    this->write_(this->tx_buf_, this->tx_buflen_);
-    this->tx_buflen_ = 0;
-  }
+bool VNCDisplay::tx_flush_() {
+  if (this->tx_buflen_ == 0)
+    return true;
+  ssize_t res = this->write_(this->tx_buf_, this->tx_buflen_);
+  this->tx_buflen_ = 0;  // never retry stale data, the RFB stream is byte-exact
+  return res >= 0;
 }
 
-/// Pack one rectangle into the transmit buffer, flushing as required.
-void VNCDisplay::send_framebuffer_(const rect_t &r) {
+/// Pack one rectangle into the transmit buffer, flushing as required. Returns false once the
+/// socket has failed, so a client that disappears mid-frame does not cost us the rest of the
+/// framebuffer in pointless PSRAM reads.
+bool VNCDisplay::send_framebuffer_(const rect_t &r) {
   size_t x_start = r.x_min;
   size_t y_start = r.y_min;
   size_t w = r.x_max - r.x_min + 1;
   size_t h = r.y_max - r.y_min + 1;
   ESP_LOGV(TAG, "Send framebuffer %u/%u %ux%u", (unsigned) x_start, (unsigned) y_start, (unsigned) w, (unsigned) h);
-  if (this->tx_rem_() < 12)
-    this->tx_flush_();
+  if (this->tx_rem_() < 12 && !this->tx_flush_())
+    return false;
   this->tx_16(x_start);
   this->tx_16(y_start);
   this->tx_16(w);
@@ -542,13 +571,21 @@ void VNCDisplay::send_framebuffer_(const rect_t &r) {
   this->tx_16(0);  // raw encoding
   this->tx_16(0);
   for (size_t y = 0; y != h; y++) {
-    size_t bytes = w * PIXEL_BYTES;
-    if (this->tx_rem_() < bytes)
-      this->tx_flush_();
-    memcpy(this->tx_buf_ + this->tx_buflen_,
-           this->display_buffer_ + ((y + y_start) * this->width_ + x_start) * PIXEL_BYTES, bytes);
-    this->tx_buflen_ += bytes;
+    const uint8_t *src = this->display_buffer_ + ((y + y_start) * this->width_ + x_start) * PIXEL_BYTES;
+    size_t remaining = w * PIXEL_BYTES;
+    // A row can be wider than the staging buffer, so copy it in chunks rather than assuming
+    // it fits after a flush.
+    while (remaining != 0) {
+      if (this->tx_rem_() == 0 && !this->tx_flush_())
+        return false;
+      size_t chunk = std::min(remaining, this->tx_rem_());
+      memcpy(this->tx_buf_ + this->tx_buflen_, src, chunk);
+      this->tx_buflen_ += chunk;
+      src += chunk;
+      remaining -= chunk;
+    }
   }
+  return true;
 }
 
 void VNCDisplay::send_batch_(const rect_t *rects, size_t count) {
@@ -560,8 +597,10 @@ void VNCDisplay::send_batch_(const rect_t *rects, size_t count) {
   this->tx_8(0);  // FramebufferUpdate
   this->tx_8(0);  // padding
   this->tx_16(count);
-  for (size_t i = 0; i != count; i++)
-    this->send_framebuffer_(rects[i]);
+  for (size_t i = 0; i != count; i++) {
+    if (!this->send_framebuffer_(rects[i]))
+      return;  // socket gone - the main loop tears it down and drains the queue
+  }
   this->tx_flush_();
 }
 

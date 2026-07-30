@@ -148,8 +148,10 @@ class VNCDisplay : public display::Display {
   size_t tx_rem_() const { return TX_BUF_SIZE - this->tx_buflen_; }
   void tx_8(uint8_t value);
   void tx_16(uint16_t value);
-  void tx_flush_();
-  void send_framebuffer_(const rect_t &r);
+  /// Write out whatever is staged. Returns false if the socket failed, so callers can stop
+  /// pushing data at a client that has gone away.
+  bool tx_flush_();
+  bool send_framebuffer_(const rect_t &r);
   void send_batch_(const rect_t *rects, size_t count);
   void tx_task_();
 
