@@ -49,6 +49,7 @@ static const size_t TX_BUF_SIZE = 4096;
 enum ClientState {
   STATE_INVALID,
   STATE_VERSION,
+  STATE_AUTH,
   STATE_CLIENT_INIT,
   STATE_READY,
 };
@@ -109,6 +110,8 @@ class VNCDisplay : public display::Display {
     this->height_ = height;
   }
   void set_port(uint16_t port) { this->port_ = port; }
+  /// Enable RFB VNC Authentication (security type 2). At most 8 characters are used.
+  void set_password(const char *password);
   void set_on_connect(std::function<void()> &&on_connect) { this->on_connect_ = std::move(on_connect); }
   void set_on_disconnect(std::function<void()> &&on_disconnect) { this->on_disconnect_ = std::move(on_disconnect); }
 
@@ -157,6 +160,9 @@ class VNCDisplay : public display::Display {
   void update_frame_();
 
   // RFB protocol
+  /// Accumulate exactly len bytes of handshake into handshake_buf_ across loop
+  /// iterations. Returns true once the whole lot has arrived.
+  bool read_exact_(size_t len);
   size_t build_init_(uint8_t *buffer);
   bool process_();
   void client_loop_();
@@ -176,6 +182,15 @@ class VNCDisplay : public display::Display {
 
   circ_buf_t inq_{};
   size_t skip_bytes_{0};
+
+  /// NUL-terminated, empty when authentication is disabled. Only 8 characters are significant.
+  char password_[9]{};
+  uint8_t challenge_[16]{};
+  /// Staging area for the fixed-size handshake reads, which can arrive split across segments.
+  uint8_t handshake_buf_[16]{};
+  size_t handshake_have_{0};
+  /// millis() value before which no new client is accepted, 0 when there is no delay pending.
+  uint32_t auth_retry_at_{0};
 
   uint8_t tx_buf_[TX_BUF_SIZE];
   size_t tx_buflen_{0};

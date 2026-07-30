@@ -13,6 +13,8 @@
 #include "esphome/components/display/display_color_utils.h"
 #include "esphome/components/network/util.h"
 
+#include "vnc_des.h"
+
 #ifdef USE_ESP32
 #include <freertos/task.h>
 #endif
@@ -24,6 +26,9 @@ static const char *const TAG = "vnc";
 static const size_t VERSION_LEN = 12;
 /// Give up on a partial socket write after this long and drop the client.
 static const uint32_t WRITE_TIMEOUT_MS = 2000;
+/// Refuse new connections for this long after a failed password, to slow down guessing.
+static const uint32_t AUTH_RETRY_DELAY_MS = 3000;
+static const size_t CHALLENGE_LEN = 16;
 
 static const uint8_t RFB_MAGIC[VERSION_LEN] = {
     'R', 'F', 'B', ' ', '0', '0', '3', '.', '0', '0', '3', '\n',
@@ -151,6 +156,12 @@ void VNCDisplay::add_touchscreen(VNCTouchscreen *tp) {
   this->touchscreens_.add([tp](bool touching, uint16_t x, uint16_t y) { tp->update_pointer(touching, x, y); });
 }
 
+void VNCDisplay::set_password(const char *password) {
+  // Only the first 8 characters take part in the DES key; display.py rejects anything longer.
+  strncpy(this->password_, password, sizeof(this->password_) - 1);
+  this->password_[sizeof(this->password_) - 1] = '\0';
+}
+
 float VNCDisplay::get_setup_priority() const { return setup_priority::HARDWARE; }
 
 void VNCDisplay::setup() {
@@ -202,8 +213,10 @@ void VNCDisplay::dump_config() {
                 "VNC Display:\n"
                 "  Dimensions: %dpx x %dpx\n"
                 "  Port: %u\n"
+                "  Authentication: %s\n"
                 "  Touchscreens: %u",
-                this->get_width(), this->get_height(), this->port_, (unsigned) this->touchscreens_.size());
+                this->get_width(), this->get_height(), this->port_,
+                this->password_[0] != '\0' ? "VNC challenge-response" : "none", (unsigned) this->touchscreens_.size());
 }
 
 void VNCDisplay::loop() {
@@ -380,6 +393,11 @@ void VNCDisplay::end_socket_() {
 }
 
 void VNCDisplay::accept_client_() {
+  if (this->auth_retry_at_ != 0) {
+    if ((int32_t) (millis() - this->auth_retry_at_) < 0)
+      return;  // still backing off from a failed password
+    this->auth_retry_at_ = 0;
+  }
   struct sockaddr_storage source_addr;
   socklen_t addr_len = sizeof(source_addr);
   auto sock = this->listen_sock_->accept((struct sockaddr *) &source_addr, &addr_len);
@@ -394,6 +412,7 @@ void VNCDisplay::accept_client_() {
   this->state_ = STATE_VERSION;
   buf_clr(this->inq_);
   this->skip_bytes_ = 0;
+  this->handshake_have_ = 0;
   ESP_LOGD(TAG, "Client connected");
   if (this->write_(RFB_MAGIC, sizeof RFB_MAGIC) < 0)
     this->disconnect_pending_ = true;
@@ -414,6 +433,7 @@ void VNCDisplay::disconnect_() {
   }
   buf_clr(this->inq_);
   this->skip_bytes_ = 0;
+  this->handshake_have_ = 0;
   this->mark_clean_();
   if (!was_connected)
     return;
@@ -606,6 +626,17 @@ void VNCDisplay::update_frame_() {
 
 // -------------------------------------------------------------------- RFB protocol
 
+bool VNCDisplay::read_exact_(size_t len) {
+  while (this->handshake_have_ < len) {
+    ssize_t err = this->read_(this->handshake_buf_ + this->handshake_have_, len - this->handshake_have_);
+    if (err <= 0)
+      return false;  // would block, or the client went away
+    this->handshake_have_ += err;
+  }
+  this->handshake_have_ = 0;
+  return true;
+}
+
 size_t VNCDisplay::build_init_(uint8_t *buffer) {
   uint8_t *sp = buffer;
   sp = put16_be(sp, this->width_);
@@ -730,27 +761,69 @@ void VNCDisplay::client_loop_() {
   ssize_t err;
 
   switch (this->state_) {
-    case STATE_VERSION:
-      err = this->read_(buffer, VERSION_LEN);
-      if (err <= 0)
+    case STATE_VERSION: {
+      if (!this->read_exact_(VERSION_LEN))
         break;
-      ESP_LOGD(TAG, "Read %.*s as version", (int) err, buffer);
+      ESP_LOGD(TAG, "Read %.*s as version", (int) VERSION_LEN, this->handshake_buf_);
       // RFB 3.3: the server dictates the security type as a 4 byte big-endian word.
       buffer[0] = 0;
       buffer[1] = 0;
       buffer[2] = 0;
-      buffer[3] = AUTH_NONE;
-      if (this->write_(buffer, 4) < 0)
+      if (this->password_[0] == '\0') {
+        buffer[3] = AUTH_NONE;
+        if (this->write_(buffer, 4) < 0)
+          break;
+        this->state_ = STATE_CLIENT_INIT;
         break;
+      }
+      // VNC Authentication: the security type is followed by a 16 byte random challenge.
+      buffer[3] = AUTH_VNC;
+      if (!random_bytes(this->challenge_, CHALLENGE_LEN)) {
+        ESP_LOGE(TAG, "Could not generate an authentication challenge");
+        this->disconnect_pending_ = true;
+        break;
+      }
+      memcpy(buffer + 4, this->challenge_, CHALLENGE_LEN);
+      if (this->write_(buffer, 4 + CHALLENGE_LEN) < 0)
+        break;
+      this->state_ = STATE_AUTH;
+      break;
+    }
+
+    case STATE_AUTH: {
+      // The client returns the challenge DES-encrypted with the password.
+      if (!this->read_exact_(CHALLENGE_LEN))
+        break;
+      uint8_t expected[CHALLENGE_LEN];
+      vnc_auth_response(this->password_, strlen(this->password_), this->challenge_, expected);
+      // Constant-time compare so a wrong password leaks nothing through timing.
+      uint8_t diff = 0;
+      for (size_t i = 0; i != CHALLENGE_LEN; i++)
+        diff |= this->handshake_buf_[i] ^ expected[i];
+      buffer[0] = 0;
+      buffer[1] = 0;
+      buffer[2] = 0;
+      buffer[3] = diff == 0 ? 0 : 1;  // SecurityResult: 0 = OK, 1 = failed
+      this->write_(buffer, 4);
+      if (diff != 0) {
+        // RFB 3.3 has no reason string - the server just closes the connection.
+        ESP_LOGW(TAG, "Authentication failed, dropping client");
+        this->auth_retry_at_ = millis() + AUTH_RETRY_DELAY_MS;
+        if (this->auth_retry_at_ == 0)
+          this->auth_retry_at_ = 1;
+        this->disconnect_pending_ = true;
+        break;
+      }
+      ESP_LOGD(TAG, "Client authenticated");
       this->state_ = STATE_CLIENT_INIT;
       break;
+    }
 
     case STATE_CLIENT_INIT: {
       // ClientInit is a single byte: the shared-desktop flag.
-      err = this->read_(buffer, 1);
-      if (err <= 0)
+      if (!this->read_exact_(1))
         break;
-      ESP_LOGV(TAG, "ClientInit shared flag %u", buffer[0]);
+      ESP_LOGV(TAG, "ClientInit shared flag %u", this->handshake_buf_[0]);
       size_t len = this->build_init_(buffer);
       if (this->write_(buffer, len) < 0)
         break;
