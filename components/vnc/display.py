@@ -25,6 +25,20 @@ AUTO_LOAD = ["socket", "touchscreen"]
 # The transmit task needs FreeRTOS or pthreads.
 SUPPORTED_PLATFORMS = [PLATFORM_ESP32, PLATFORM_HOST]
 
+
+def _consume_vnc_sockets(config):
+    """Declare this component's socket usage so the platform can size its socket pool.
+
+    Each vnc display holds one listening socket for the lifetime of the component and
+    one accepted socket while a client is attached.
+    """
+    from esphome.components import socket
+
+    socket.consume_sockets(1, "vnc", socket.SocketType.TCP_LISTEN)(config)
+    socket.consume_sockets(1, "vnc")(config)
+    return config
+
+
 # FULL_DISPLAY_SCHEMA already extends cv.polling_component_schema("1s") and makes
 # `lambda` and `pages` mutually exclusive, so neither needs repeating here.
 CONFIG_SCHEMA = cv.All(
@@ -54,6 +68,7 @@ CONFIG_SCHEMA = cv.All(
         }
     ),
     cv.only_on(SUPPORTED_PLATFORMS),
+    _consume_vnc_sockets,
 )
 
 
