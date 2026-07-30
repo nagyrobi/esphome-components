@@ -1,12 +1,6 @@
 # nagyrobi/esphome-components
 
-External components for [ESPHome](https://esphome.io/).
-
-```yaml
-external_components:
-  - source: github://nagyrobi/esphome-components
-    components: [vnc]
-```
+[External components](https://esphome.io/components/external_components.html) for [ESPHome](https://esphome.io/).
 
 | Component | Description |
 |---|---|
