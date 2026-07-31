@@ -41,14 +41,7 @@ external_components:
 ```
 
 While iterating, add `refresh: 0s` so ESPHome re-fetches the component instead of using a cached
-copy. Pin a specific version with `@branch` or `@tag` if you want reproducible builds:
-
-```yaml
-external_components:
-  - source: github://nagyrobi/esphome-components@main
-    refresh: 0s
-    components: [vnc]
-```
+copy. 
 
 ## Quick start
 
@@ -91,11 +84,8 @@ display:
 
 ### Options specific to this platform
 
-- **`dimensions`** (**Required**) — the size of the virtual screen. Either shorthand, or explicit:
+- **`dimensions`** (**Required**) — the size of the virtual screen: 
 
-  ```yaml
-  dimensions: 480x480
-  ```
   ```yaml
   dimensions:
     width: 480
@@ -158,29 +148,15 @@ touchscreen:
     id: vnc_touch
     display: vnc_display
     on_release:
-      - logger.log: "tapped"
+      - logger.log: "clicked"
 ```
 
 - **`display`** (*Optional*, ID) — the display these touches belong to. Auto-detected if your config
   has exactly one display; **required as soon as you have more than one**, otherwise you get
   `Too many candidates found for 'display'`.
-- **`vnc_id`** (*Optional*, ID) — the VNC display that feeds pointer events in. Auto-detected if
-  there is exactly one `vnc` display; required if you have several.
 - **`id`** (*Optional*, ID) — an ID for the touchscreen, for use in `lvgl:` or automations.
 
-All the standard [touchscreen](https://esphome.io/components/touchscreen/index.html) options work
-too: `on_touch`, `on_release`, `on_update`, `touch_timeout`, `transform` (`mirror_x`, `mirror_y`,
-`swap_xy`) and `calibration`.
-
-`update_interval` is inherited but meaningless here — pointer events arrive from the network rather
-than being polled. On the first tick the touchscreen component notices this and stops its own poller,
-logging once:
-
-```
-[W][touchscreen] Touch Polling Stopped. You can safely remove the 'update_interval:' variable from the YAML file.
-```
-
-That is expected and harmless; it is the same message any interrupt-driven touchscreen produces.
+All the standard [touchscreen](https://esphome.io/components/touchscreen/index.html) options work.
 
 ## Authentication
 
@@ -247,8 +223,12 @@ touchscreen:
     display: vnc_display
 
 lvgl:
-  displays: [my_display, vnc_display]
-  touchscreens: [my_touch, vnc_touch]
+  displays:
+    - my_display
+    - vnc_display
+  touchscreens:
+    - my_touch
+    - vnc_touch]
   color_depth: 16
   buffer_size: 100%
   # ... your widgets
@@ -321,8 +301,7 @@ Set `logger: level: DEBUG` to see the session lifecycle.
   macOS Screen Sharing).
 - **No keyboard input.** Key events are received and logged at verbose level, but not delivered
   anywhere. Only pointer events become ESPHome touch events.
-- **`rotation:` on the display is ignored** — see the note in
-  [Inherited display options](#inherited-display-options).
+- **`rotation:` on the display is ignored** — see the note in [Inherited display options](#inherited-display-options).
 - **Clipboard is discarded** — text pasted into the viewer is read off the wire and thrown away.
 - **The client's requested pixel format is not honoured** — the server always sends 32bpp
   little-endian true colour.
