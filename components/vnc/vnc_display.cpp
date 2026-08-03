@@ -803,7 +803,7 @@ void VNCDisplay::client_loop_() {
     case STATE_VERSION: {
       if (!this->read_exact_(VERSION_LEN))
         break;
-      ESP_LOGD(TAG, "Read %.*s as version", (int) VERSION_LEN, this->handshake_buf_);
+      ESP_LOGD(TAG, "Read %.*s as version", (int) VERSION_LEN - 1, this->handshake_buf_);
       // RFB 3.3: the server dictates the security type as a 4 byte big-endian word.
       buffer[0] = 0;
       buffer[1] = 0;
