@@ -33,6 +33,10 @@
 #include <pthread.h>
 #endif
 
+#ifdef USE_VNC_COMPRESSION
+#include <zlib.h>
+#endif
+
 namespace esphome::vnc {
 
 /// Bytes per pixel in the local framebuffer. Pixels are stored as big-endian RGB565,
@@ -46,6 +50,14 @@ static const size_t RING_SIZE = 256;
 static const size_t QUEUE_DEPTH = 200;
 /// Staging buffer for outgoing framebuffer data.
 static const size_t TX_BUF_SIZE = 4096;
+
+#ifdef USE_VNC_COMPRESSION
+/// Deflate window and hash sizes. 12/4 costs ~30 KiB and gives within 3% of the ratio that
+/// zlib's 262 KiB default manages on UI content, so the extra memory buys essentially nothing.
+static const int ZLIB_WINDOW_BITS = 12;
+static const int ZLIB_MEM_LEVEL = 4;
+static const int ZLIB_LEVEL = 1;
+#endif
 
 enum ClientState {
   STATE_INVALID,
@@ -127,6 +139,10 @@ class VNCDisplay : public display::Display {
   void set_port(uint16_t port) { this->port_ = port; }
   /// Enable RFB VNC Authentication (security type 2). At most 8 characters are used.
   void set_password(const char *password);
+#ifdef USE_VNC_COMPRESSION
+  /// Offer zlib encoding. Only used if the client also asks for it.
+  void set_compression(bool compression) { this->compression_enabled_ = compression; }
+#endif
   void set_on_connect(std::function<void()> &&on_connect) { this->on_connect_ = std::move(on_connect); }
   void set_on_disconnect(std::function<void()> &&on_disconnect) { this->on_disconnect_ = std::move(on_disconnect); }
 
@@ -171,6 +187,13 @@ class VNCDisplay : public display::Display {
   /// Convert count framebuffer pixels into the client's format.
   void convert_row_(const uint8_t *src, uint8_t *dst, size_t count);
   bool send_framebuffer_(const rect_t &r);
+#ifdef USE_VNC_COMPRESSION
+  /// Lazily create the per-connection deflate stream. False if it could not be allocated.
+  bool zlib_begin_();
+  void zlib_end_();
+  /// Compress and send one rectangle with encoding 6. False on socket or deflate failure.
+  bool send_framebuffer_zlib_(const rect_t &r, size_t x_start, size_t y_start, size_t w, size_t h);
+#endif
   void send_batch_(const rect_t *rects, size_t count);
   void tx_task_();
 
@@ -209,6 +232,20 @@ class VNCDisplay : public display::Display {
   volatile bool update_requested_{false};
 
   pixel_format_t client_format_{};
+  /// True once the client has listed zlib in SetEncodings and compression is configured.
+  bool use_zlib_{false};
+  /// Entries of a SetEncodings list still to be consumed.
+  uint16_t encodings_left_{0};
+#ifdef USE_VNC_COMPRESSION
+  bool compression_enabled_{false};
+  bool zlib_ready_{false};
+  z_stream zlib_{};
+  uint8_t *zlib_out_{nullptr};
+  size_t zlib_out_size_{0};
+  /// Scratch for one converted row when the client format is not native.
+  uint8_t *zlib_row_{nullptr};
+  size_t zlib_row_size_{0};
+#endif
 
   circ_buf_t inq_{};
   size_t skip_bytes_{0};
