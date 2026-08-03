@@ -290,7 +290,8 @@ Set `logger: level: DEBUG` to see the session lifecycle.
 | `Client offered N encodings` | Normal. Only raw encoding is implemented, so the list is ignored. |
 | `Connection closed by peer while writing (errno 104)` | Debug-level, and **normal**. A client that closes while frames are in flight still has unread data buffered, and TCP requires it to answer with a reset. Only an idle client produces a clean close. |
 | `Client disconnected` | Session over, resources released. |
-| `Client requested unsupported pixel format` | The client asked for a format other than 32bpp true colour. The server keeps sending its own format; colours may look wrong. Rare — most clients accept what the server advertises. |
+| `Client pixel format: … ` | Debug-level. The format the client asked for; `(native)` means no conversion is needed. |
+| `Unsupported pixel format …, falling back to RGB565` | A palette or unusual-width format the server cannot produce. Colours will look wrong, but the stream stays in sync. |
 | `Could not allocate N bytes for the display buffer - PSRAM is required at this size` | Add a `psram:` block, or reduce `dimensions`. |
 | `Socket write failed: errno N` (warning) | A real socket error, as opposed to the routine disconnect above. |
 
@@ -304,8 +305,9 @@ Set `logger: level: DEBUG` to see the session lifecycle.
   anywhere. Only pointer events become ESPHome touch events.
 - **`rotation:` on the display is ignored** — see the note in [Inherited display options](#inherited-display-options).
 - **Clipboard is discarded** — text pasted into the viewer is read off the wire and thrown away.
-- **The client's requested pixel format is not honoured** — the server always sends 16bpp
-  big-endian RGB565 true colour. This matches LVGL's `color_depth: 16` exactly, so the common
-  path involves no pixel conversion at all.
+- **Framebuffer precision is RGB565.** The server stores 16bpp, matching LVGL's
+  `color_depth: 16` exactly, so the common flush involves no pixel conversion at all. A client
+  asking for 32bpp gets correct colours, but upconverted from 565 — smooth gradients may band.
+  Non-true-colour (palette) formats are not supported and fall back to RGB565.
 - **Frames are not double-buffered.** A client can occasionally see a partially redrawn region if a
   flush lands mid-draw. In practice this shows up as brief tearing, not corruption.

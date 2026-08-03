@@ -434,6 +434,9 @@ void VNCDisplay::accept_client_() {
   buf_clr(this->inq_);
   this->skip_bytes_ = 0;
   this->handshake_have_ = 0;
+  // Until the client says otherwise it gets what ServerInit advertised.
+  static const uint8_t DEFAULT_SPEC[13] = {16, 16, 1, 1, 0, 0x1F, 0, 0x3F, 0, 0x1F, 11, 5, 0};
+  this->update_pixel_format_(DEFAULT_SPEC);
   ESP_LOGD(TAG, "Client connected");
   if (this->write_(RFB_MAGIC, sizeof RFB_MAGIC) < 0)
     this->disconnect_pending_ = true;
@@ -556,6 +559,23 @@ bool VNCDisplay::tx_flush_() {
   return res >= 0;
 }
 
+/// Convert one framebuffer row into the client's pixel format.
+void VNCDisplay::convert_row_(const uint8_t *src, uint8_t *dst, size_t count) {
+  const auto &f = this->client_format_;
+  const size_t bytes = f.bits_per_pixel / 8;
+  for (size_t i = 0; i != count; i++, src += PIXEL_BYTES) {
+    uint16_t c = (uint16_t) ((src[0] << 8) | src[1]);  // framebuffer is big-endian 565
+    uint32_t v = f.lut_r[(c >> 11) & 0x1F] | f.lut_g[(c >> 5) & 0x3F] | f.lut_b[c & 0x1F];
+    if (f.big_endian) {
+      for (size_t b = bytes; b-- != 0;)
+        *dst++ = (uint8_t) (v >> (8 * b));
+    } else {
+      for (size_t b = 0; b != bytes; b++)
+        *dst++ = (uint8_t) (v >> (8 * b));
+    }
+  }
+}
+
 /// Pack one rectangle into the transmit buffer, flushing as required. Returns false once the
 /// socket has failed, so a client that disappears mid-frame does not cost us the rest of the
 /// framebuffer in pointless PSRAM reads.
@@ -564,6 +584,7 @@ bool VNCDisplay::send_framebuffer_(const rect_t &r) {
   size_t y_start = r.y_min;
   size_t w = r.x_max - r.x_min + 1;
   size_t h = r.y_max - r.y_min + 1;
+  const size_t wire = this->wire_bytes_();
   ESP_LOGV(TAG, "Send framebuffer %u/%u %ux%u", (unsigned) x_start, (unsigned) y_start, (unsigned) w, (unsigned) h);
   if (this->tx_rem_() < 12 && !this->tx_flush_())
     return false;
@@ -573,27 +594,32 @@ bool VNCDisplay::send_framebuffer_(const rect_t &r) {
   this->tx_16(h);
   this->tx_16(0);  // raw encoding
   this->tx_16(0);
-  const bool full_width = (x_start == 0 && w == (size_t) this->width_);
-  if (full_width && h * w * PIXEL_BYTES >= TX_BUF_SIZE) {
-    // Full-width rectangles are contiguous in the framebuffer, so send them directly rather
-    // than copying through the staging buffer. This is the common case for a full refresh.
+
+  const bool direct = this->client_format_.native && x_start == 0 && w == (size_t) this->width_;
+  if (direct && h * w * PIXEL_BYTES >= TX_BUF_SIZE) {
+    // Native format and full width: the rows are contiguous, so send straight from the
+    // framebuffer with no copy and no conversion.
     if (!this->tx_flush_())
       return false;
     const uint8_t *src = this->display_buffer_ + y_start * this->width_ * PIXEL_BYTES;
     return this->write_(src, h * w * PIXEL_BYTES) >= 0;
   }
+
   for (size_t y = 0; y != h; y++) {
     const uint8_t *src = this->display_buffer_ + ((y + y_start) * this->width_ + x_start) * PIXEL_BYTES;
-    size_t remaining = w * PIXEL_BYTES;
-    // A row can be wider than the staging buffer, so copy it in chunks rather than assuming
-    // it fits after a flush.
+    size_t remaining = w;
+    // A row can need more space than the staging buffer holds, so emit it in chunks.
     while (remaining != 0) {
-      if (this->tx_rem_() == 0 && !this->tx_flush_())
+      if (this->tx_rem_() < wire && !this->tx_flush_())
         return false;
-      size_t chunk = std::min(remaining, this->tx_rem_());
-      memcpy(this->tx_buf_ + this->tx_buflen_, src, chunk);
-      this->tx_buflen_ += chunk;
-      src += chunk;
+      size_t chunk = std::min(remaining, this->tx_rem_() / wire);
+      if (this->client_format_.native) {
+        memcpy(this->tx_buf_ + this->tx_buflen_, src, chunk * PIXEL_BYTES);
+      } else {
+        this->convert_row_(src, this->tx_buf_ + this->tx_buflen_, chunk);
+      }
+      this->tx_buflen_ += chunk * wire;
+      src += chunk * PIXEL_BYTES;
       remaining -= chunk;
     }
   }
@@ -688,6 +714,51 @@ bool VNCDisplay::read_exact_(size_t len) {
   return true;
 }
 
+void VNCDisplay::update_pixel_format_(const uint8_t *spec) {
+  auto &f = this->client_format_;
+  f.bits_per_pixel = spec[0];
+  f.big_endian = spec[2] != 0;
+  f.true_colour = spec[3] != 0;
+  f.red_max = get16_be(spec + 4);
+  f.green_max = get16_be(spec + 6);
+  f.blue_max = get16_be(spec + 8);
+  f.red_shift = spec[10];
+  f.green_shift = spec[11];
+  f.blue_shift = spec[12];
+
+  // Anything we cannot represent falls back to our own format; the client will render it
+  // wrongly, but that is better than desynchronising the stream by sending the wrong length.
+  if (!f.true_colour || (f.bits_per_pixel != 8 && f.bits_per_pixel != 16 && f.bits_per_pixel != 32) || f.red_max == 0 ||
+      f.green_max == 0 || f.blue_max == 0) {
+    ESP_LOGW(TAG, "Unsupported pixel format (bits %u, true colour %s), falling back to RGB565", f.bits_per_pixel,
+             f.true_colour ? "yes" : "no");
+    f.bits_per_pixel = 16;
+    f.big_endian = true;
+    f.true_colour = true;
+    f.red_max = 0x1F;
+    f.green_max = 0x3F;
+    f.blue_max = 0x1F;
+    f.red_shift = 11;
+    f.green_shift = 5;
+    f.blue_shift = 0;
+  }
+
+  f.native = f.bits_per_pixel == 16 && f.big_endian && f.red_max == 0x1F && f.green_max == 0x3F && f.blue_max == 0x1F &&
+             f.red_shift == 11 && f.green_shift == 5 && f.blue_shift == 0;
+
+  // Expand each 565 component to the client's range once, pre-shifted into position.
+  for (uint32_t i = 0; i != 32; i++) {
+    f.lut_r[i] = ((i * f.red_max + 15) / 31) << f.red_shift;
+    f.lut_b[i] = ((i * f.blue_max + 15) / 31) << f.blue_shift;
+  }
+  for (uint32_t i = 0; i != 64; i++)
+    f.lut_g[i] = ((i * f.green_max + 31) / 63) << f.green_shift;
+
+  ESP_LOGD(TAG, "Client pixel format: %u bpp, %s endian, max %u/%u/%u, shift %u/%u/%u%s", f.bits_per_pixel,
+           f.big_endian ? "big" : "little", f.red_max, f.green_max, f.blue_max, f.red_shift, f.green_shift,
+           f.blue_shift, f.native ? " (native)" : "");
+}
+
 size_t VNCDisplay::build_init_(uint8_t *buffer) {
   uint8_t *sp = buffer;
   sp = put16_be(sp, this->width_);
@@ -732,10 +803,8 @@ bool VNCDisplay::process_() {
     case 0:  // SetPixelFormat
       if (buf_size(this->inq_) >= 20) {
         buf_copy(this->inq_, buffer, 20);
-        if (buffer[4] != 16 || buffer[6] == 0 || buffer[7] == 0) {
-          ESP_LOGW(TAG, "Client requested unsupported pixel format (bits %u, depth %u, %s endian, true colour %s)",
-                   buffer[4], buffer[5], buffer[6] ? "big" : "little", buffer[7] ? "yes" : "no");
-        }
+        // RFB requires the server to honour whatever the client asks for.
+        this->update_pixel_format_(buffer + 4);
         return true;
       }
       break;

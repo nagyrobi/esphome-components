@@ -67,6 +67,20 @@ struct circ_buf_t {
   uint8_t outp;
 };
 
+/// The pixel format the client asked for via SetPixelFormat. RFB requires the server to
+/// honour it, so everything is converted out of the native 565 framebuffer at send time.
+struct pixel_format_t {
+  uint8_t bits_per_pixel;
+  bool big_endian;
+  bool true_colour;
+  uint16_t red_max, green_max, blue_max;
+  uint8_t red_shift, green_shift, blue_shift;
+  /// True when the format is byte-for-byte our framebuffer layout, so sending is a memcpy.
+  bool native;
+  /// 565 component -> pre-shifted client component. Avoids a divide per pixel per channel.
+  uint32_t lut_r[32], lut_g[64], lut_b[32];
+};
+
 struct rect_t {
   int16_t x_min;
   int16_t y_min;
@@ -154,6 +168,8 @@ class VNCDisplay : public display::Display {
   /// Write out whatever is staged. Returns false if the socket failed, so callers can stop
   /// pushing data at a client that has gone away.
   bool tx_flush_();
+  /// Convert count framebuffer pixels into the client's format.
+  void convert_row_(const uint8_t *src, uint8_t *dst, size_t count);
   bool send_framebuffer_(const rect_t &r);
   void send_batch_(const rect_t *rects, size_t count);
   void tx_task_();
@@ -169,6 +185,10 @@ class VNCDisplay : public display::Display {
   /// iterations. Returns true once the whole lot has arrived.
   bool read_exact_(size_t len);
   size_t build_init_(uint8_t *buffer);
+  /// Recompute the conversion tables after the client format changes.
+  void update_pixel_format_(const uint8_t *spec);
+  /// Bytes each pixel occupies on the wire for the current client format.
+  size_t wire_bytes_() const { return this->client_format_.bits_per_pixel / 8; }
   bool process_();
   void client_loop_();
 
@@ -184,6 +204,8 @@ class VNCDisplay : public display::Display {
   Mutex sock_mutex_;
   volatile bool disconnect_pending_{false};
   volatile ClientState state_{STATE_INVALID};
+
+  pixel_format_t client_format_{};
 
   circ_buf_t inq_{};
   size_t skip_bytes_{0};
