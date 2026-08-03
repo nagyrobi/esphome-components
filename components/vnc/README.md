@@ -105,7 +105,8 @@ display:
   default. See [Authentication](#authentication).
 
 - **`on_connect`** (*Optional*, [Automation](https://esphome.io/guides/automations.html)) — runs when
-  a client has finished the handshake and is about to receive its first frame. Useful for waking a
+  a client has finished the handshake. The first frame is sent slightly later, once the client has
+  requested it and agreed a pixel format. Useful for waking a
   paused UI or turning a backlight on.
 
 - **`on_disconnect`** (*Optional*, Automation) — runs when the client goes away, for any reason
@@ -253,28 +254,29 @@ Points worth knowing:
 
 ## Memory and bandwidth
 
-The framebuffer is 4 bytes per pixel, allocated once at startup:
+The framebuffer is 2 bytes per pixel (RGB565), allocated once at startup:
 
 | Dimensions | Framebuffer |
 |---|---|
-| 320×240 | 300 KiB |
-| 480×480 | 900 KiB |
-| 800×480 | 1.5 MiB |
+| 320×240 | 150 KiB |
+| 480×480 | 450 KiB |
+| 800×480 | 750 KiB |
 
 PSRAM is preferred, with internal RAM as a fallback. If the allocation fails the component logs an
 error naming the size it wanted and marks itself failed, so a missing `psram:` block shows up
 immediately rather than as a mystery crash. On top of that it uses a fixed 4 KiB staging buffer and a
 1.6 KiB rectangle queue in internal RAM.
 
-Wire traffic is the same 4 bytes per pixel, uncompressed — only raw encoding is implemented. A full
-480×480 refresh is 900 KiB. Only changed rectangles are sent, so a UI with a few updating labels
+Wire traffic is the same 2 bytes per pixel, uncompressed — only raw encoding is implemented. A full
+480×480 refresh is 450 KiB. Only changed rectangles are sent, so a UI with a few updating labels
 costs very little; something animating the whole screen costs a lot.
 
 **If your device also drives an RGB parallel panel** (ST7701S and friends on an ESP32-S3), be aware
 that the VNC framebuffer and the panel's scan-out share PSRAM bandwidth. A connected client streaming
 frames can starve the panel's DMA and make the physical display flicker. Things that help: keep
-`color_depth: 16` in LVGL so the fast conversion path is used, avoid animating large areas, and keep
-the panel's `pclk_frequency` no higher than it needs to be.
+`color_depth: 16` in LVGL, which matches the framebuffer format exactly and makes each flush a plain
+`memcpy` with no per-pixel work; avoid animating large areas; and keep the panel's `pclk_frequency` no
+higher than it needs to be.
 
 ## What the log messages mean
 
@@ -289,7 +291,8 @@ Set `logger: level: DEBUG` to see the session lifecycle.
 | `Client offered N encodings` | Normal. Only raw encoding is implemented, so the list is ignored. |
 | `Connection closed by peer while writing (errno 104)` | Debug-level, and **normal**. A client that closes while frames are in flight still has unread data buffered, and TCP requires it to answer with a reset. Only an idle client produces a clean close. |
 | `Client disconnected` | Session over, resources released. |
-| `Client requested unsupported pixel format` | The client asked for a format other than 32bpp true colour. The server keeps sending its own format; colours may look wrong. Rare — most clients accept what the server advertises. |
+| `Client pixel format: … ` | Debug-level. The format the client asked for; `(native)` means no conversion is needed. |
+| `Unsupported pixel format …, falling back to RGB565` | A palette or unusual-width format the server cannot produce. Colours will look wrong, but the stream stays in sync. |
 | `Could not allocate N bytes for the display buffer - PSRAM is required at this size` | Add a `psram:` block, or reduce `dimensions`. |
 | `Socket write failed: errno N` (warning) | A real socket error, as opposed to the routine disconnect above. |
 
@@ -303,7 +306,9 @@ Set `logger: level: DEBUG` to see the session lifecycle.
   anywhere. Only pointer events become ESPHome touch events.
 - **`rotation:` on the display is ignored** — see the note in [Inherited display options](#inherited-display-options).
 - **Clipboard is discarded** — text pasted into the viewer is read off the wire and thrown away.
-- **The client's requested pixel format is not honoured** — the server always sends 32bpp
-  little-endian true colour.
+- **Framebuffer precision is RGB565.** The server stores 16bpp, matching LVGL's
+  `color_depth: 16` exactly, so the common flush involves no pixel conversion at all. A client
+  asking for 32bpp gets correct colours, but upconverted from 565 — smooth gradients may band.
+  Non-true-colour (palette) formats are not supported and fall back to RGB565.
 - **Frames are not double-buffered.** A client can occasionally see a partially redrawn region if a
   flush lands mid-draw. In practice this shows up as brief tearing, not corruption.
