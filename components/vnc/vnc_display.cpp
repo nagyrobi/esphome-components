@@ -348,7 +348,7 @@ void VNCDisplay::draw_pixels_at(int x_start, int y_start, int w, int h, const ui
 
   // Queue the clipped rectangle - send_framebuffer_() copies straight out of the framebuffer,
   // so an out-of-range rectangle would read past the end of it and desync the RFB stream.
-  if (this->state_ == STATE_READY) {
+  if (this->state_ == STATE_READY && this->update_requested_) {
     rect_t r{(int16_t) dst_x, (int16_t) dst_y, (int16_t) (dst_x + cw - 1), (int16_t) (dst_y + ch - 1)};
     if (!this->queue_rect_(r))
       this->mark_dirty_(dst_x, dst_y, cw, ch);
@@ -434,6 +434,7 @@ void VNCDisplay::accept_client_() {
   buf_clr(this->inq_);
   this->skip_bytes_ = 0;
   this->handshake_have_ = 0;
+  this->update_requested_ = false;
   // Until the client says otherwise it gets what ServerInit advertised.
   static const uint8_t DEFAULT_SPEC[13] = {16, 16, 1, 1, 0, 0x1F, 0, 0x3F, 0, 0x1F, 11, 5, 0};
   this->update_pixel_format_(DEFAULT_SPEC);
@@ -458,6 +459,7 @@ void VNCDisplay::disconnect_() {
   buf_clr(this->inq_);
   this->skip_bytes_ = 0;
   this->handshake_have_ = 0;
+  this->update_requested_ = false;
   this->mark_clean_();
   if (!was_connected)
     return;
@@ -697,7 +699,9 @@ bool VNCDisplay::is_dirty_() const {
 }
 
 void VNCDisplay::update_frame_() {
-  if (this->is_dirty_() && this->state_ == STATE_READY && this->queue_rect_(this->dirty_rect_))
+  // update_requested_ gates the very first send: see the note in STATE_CLIENT_INIT.
+  if (this->is_dirty_() && this->state_ == STATE_READY && this->update_requested_ &&
+      this->queue_rect_(this->dirty_rect_))
     this->mark_clean_();
 }
 
@@ -831,6 +835,7 @@ bool VNCDisplay::process_() {
         uint16_t height = get16_be(buffer + 8);
         ESP_LOGV(TAG, "Framebuffer %s update request %u/%u %ux%u", incremental ? "incremental" : "immediate", xpos,
                  ypos, width, height);
+        this->update_requested_ = true;
         if (!incremental) {
           this->mark_dirty_(xpos, ypos, width, height);
           this->update_frame_();
@@ -950,10 +955,11 @@ void VNCDisplay::client_loop_() {
       this->state_ = STATE_READY;
       buf_clr(this->inq_);
       this->skip_bytes_ = 0;
-      // Always push a full frame so the client has something to show, whether or not an
-      // on_connect automation is configured.
+      // Mark the screen dirty but do not send anything yet. RFB forbids unsolicited
+      // FramebufferUpdates, and more practically the client has not sent SetPixelFormat at this
+      // point, so a frame pushed here would go out in the wrong format and be rendered as noise.
+      // The first non-incremental FramebufferUpdateRequest ships it, in the agreed format.
       this->mark_dirty_(0, 0, this->width_, this->height_);
-      this->update_frame_();
       if (this->on_connect_ != nullptr)
         this->defer([this]() { this->on_connect_(); });
       break;

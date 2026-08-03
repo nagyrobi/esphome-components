@@ -105,7 +105,8 @@ display:
   default. See [Authentication](#authentication).
 
 - **`on_connect`** (*Optional*, [Automation](https://esphome.io/guides/automations.html)) — runs when
-  a client has finished the handshake and is about to receive its first frame. Useful for waking a
+  a client has finished the handshake. The first frame is sent slightly later, once the client has
+  requested it and agreed a pixel format. Useful for waking a
   paused UI or turning a backlight on.
 
 - **`on_disconnect`** (*Optional*, Automation) — runs when the client goes away, for any reason

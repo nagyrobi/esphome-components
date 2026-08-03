@@ -204,6 +204,9 @@ class VNCDisplay : public display::Display {
   Mutex sock_mutex_;
   volatile bool disconnect_pending_{false};
   volatile ClientState state_{STATE_INVALID};
+  /// Set once the client has asked for a FramebufferUpdate. Until then nothing is sent:
+  /// RFB forbids unsolicited updates, and SetPixelFormat has usually not arrived yet.
+  volatile bool update_requested_{false};
 
   pixel_format_t client_format_{};
 
