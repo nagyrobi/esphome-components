@@ -253,28 +253,29 @@ Points worth knowing:
 
 ## Memory and bandwidth
 
-The framebuffer is 4 bytes per pixel, allocated once at startup:
+The framebuffer is 2 bytes per pixel (RGB565), allocated once at startup:
 
 | Dimensions | Framebuffer |
 |---|---|
-| 320×240 | 300 KiB |
-| 480×480 | 900 KiB |
-| 800×480 | 1.5 MiB |
+| 320×240 | 150 KiB |
+| 480×480 | 450 KiB |
+| 800×480 | 750 KiB |
 
 PSRAM is preferred, with internal RAM as a fallback. If the allocation fails the component logs an
 error naming the size it wanted and marks itself failed, so a missing `psram:` block shows up
 immediately rather than as a mystery crash. On top of that it uses a fixed 4 KiB staging buffer and a
 1.6 KiB rectangle queue in internal RAM.
 
-Wire traffic is the same 4 bytes per pixel, uncompressed — only raw encoding is implemented. A full
-480×480 refresh is 900 KiB. Only changed rectangles are sent, so a UI with a few updating labels
+Wire traffic is the same 2 bytes per pixel, uncompressed — only raw encoding is implemented. A full
+480×480 refresh is 450 KiB. Only changed rectangles are sent, so a UI with a few updating labels
 costs very little; something animating the whole screen costs a lot.
 
 **If your device also drives an RGB parallel panel** (ST7701S and friends on an ESP32-S3), be aware
 that the VNC framebuffer and the panel's scan-out share PSRAM bandwidth. A connected client streaming
 frames can starve the panel's DMA and make the physical display flicker. Things that help: keep
-`color_depth: 16` in LVGL so the fast conversion path is used, avoid animating large areas, and keep
-the panel's `pclk_frequency` no higher than it needs to be.
+`color_depth: 16` in LVGL, which matches the framebuffer format exactly and makes each flush a plain
+`memcpy` with no per-pixel work; avoid animating large areas; and keep the panel's `pclk_frequency` no
+higher than it needs to be.
 
 ## What the log messages mean
 
@@ -303,7 +304,8 @@ Set `logger: level: DEBUG` to see the session lifecycle.
   anywhere. Only pointer events become ESPHome touch events.
 - **`rotation:` on the display is ignored** — see the note in [Inherited display options](#inherited-display-options).
 - **Clipboard is discarded** — text pasted into the viewer is read off the wire and thrown away.
-- **The client's requested pixel format is not honoured** — the server always sends 32bpp
-  little-endian true colour.
+- **The client's requested pixel format is not honoured** — the server always sends 16bpp
+  big-endian RGB565 true colour. This matches LVGL's `color_depth: 16` exactly, so the common
+  path involves no pixel conversion at all.
 - **Frames are not double-buffered.** A client can occasionally see a partially redrawn region if a
   flush lands mid-draw. In practice this shows up as brief tearing, not corruption.

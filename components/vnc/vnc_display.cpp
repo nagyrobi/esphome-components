@@ -34,23 +34,15 @@ static const uint8_t RFB_MAGIC[VERSION_LEN] = {
     'R', 'F', 'B', ' ', '0', '0', '3', '.', '0', '0', '3', '\n',
 };
 
-/// 5- and 6-bit to 8-bit channel expansion, precomputed so the RGB565 conversion below
-/// matches display::ColorUtil::to_color() exactly without doing integer division per pixel.
-struct Rgb565Lut {
-  uint8_t five[32];
-  uint8_t six[64];
-  constexpr Rgb565Lut() : five(), six() {
-    for (int i = 0; i != 32; i++)
-      five[i] = (uint8_t) (255 * i / 31);
-    for (int i = 0; i != 64; i++)
-      six[i] = (uint8_t) (255 * i / 63);
-  }
-};
-static constexpr Rgb565Lut RGB565_LUT{};
+/// Pack an 8-8-8 colour into big-endian RGB565, the framebuffer's native format.
+static inline uint16_t pack_pixel(uint8_t r, uint8_t g, uint8_t b) {
+  return (uint16_t) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
 
-/// Pack a colour into the framebuffer's B, G, R, X word.
-static inline uint32_t pack_pixel(uint8_t r, uint8_t g, uint8_t b) {
-  return (uint32_t) b | ((uint32_t) g << 8) | ((uint32_t) r << 16);
+/// Store one big-endian RGB565 pixel.
+static inline void store_pixel(uint8_t *dst, uint16_t px) {
+  dst[0] = (uint8_t) (px >> 8);
+  dst[1] = (uint8_t) px;
 }
 
 static inline uint8_t *put16_be(uint8_t *buf, uint16_t value) {
@@ -266,10 +258,7 @@ void VNCDisplay::update() {
 void VNCDisplay::draw_pixel_at(int x, int y, Color color) {
   if (x < 0 || y < 0 || x >= this->width_ || y >= this->height_)
     return;
-  // A single 32 bit store: byte-wide writes to PSRAM are read-modify-write and cost
-  // four times as many bus transactions.
-  uint32_t px = pack_pixel(color.r, color.g, color.b);
-  memcpy(this->pixel_ptr_(x, y), &px, PIXEL_BYTES);
+  store_pixel(this->pixel_ptr_(x, y), pack_pixel(color.r, color.g, color.b));
   if (!this->internal_update_)
     this->mark_dirty_(x, y, 1, 1);
 }
@@ -279,10 +268,18 @@ void VNCDisplay::draw_pixel_at(int x, int y, Color color) {
 void VNCDisplay::fill(Color color) {
   if (this->display_buffer_ == nullptr)
     return;
-  uint32_t px = pack_pixel(color.r, color.g, color.b);
+  uint16_t px = pack_pixel(color.r, color.g, color.b);
   size_t count = (size_t) this->width_ * this->height_;
-  auto *dst = reinterpret_cast<uint32_t *>(this->display_buffer_);
-  std::fill_n(dst, count, px);
+  // Both bytes are equal for greys and for any colour whose high and low halves match;
+  // memset is markedly faster over PSRAM, so use it when we can.
+  uint8_t hi = (uint8_t) (px >> 8), lo = (uint8_t) px;
+  if (hi == lo) {
+    memset(this->display_buffer_, hi, count * PIXEL_BYTES);
+  } else {
+    uint8_t *dst = this->display_buffer_;
+    for (size_t i = 0; i != count; i++, dst += PIXEL_BYTES)
+      store_pixel(dst, px);
+  }
   if (!this->internal_update_)
     this->mark_dirty_(0, 0, this->width_, this->height_);
 }
@@ -296,7 +293,7 @@ void VNCDisplay::draw_pixels_at(int x_start, int y_start, int w, int h, const ui
   // to draw_rounding - 1 pixels too wide. Display::draw_pixels_at() clips per pixel and the
   // esp_lcd based drivers let IDF clip for them, so a hard reject here loses updates that every
   // other display shows.
-  const size_t src_stride = (size_t) (w + x_offset + x_pad);
+  const size_t src_pixels = (size_t) (w + x_offset + x_pad);
   const int clip_left = std::max(-x_start, 0);
   const int clip_top = std::max(-y_start, 0);
   const int dst_x = x_start + clip_left;
@@ -311,31 +308,29 @@ void VNCDisplay::draw_pixels_at(int x_start, int y_start, int w, int h, const ui
 
   if (this->rotation_ == display::DISPLAY_ROTATION_0_DEGREES && order == display::COLOR_ORDER_RGB) {
     if (bitness == display::COLOR_BITNESS_565) {
-      // This is the path LVGL takes at color_depth: 16. The generic implementation below costs
-      // three integer divides, a Color construction and a virtual draw_pixel_at() per pixel;
-      // a table lookup plus one 32 bit store is an order of magnitude cheaper, which matters a
-      // lot on a 480x480 panel sharing PSRAM bandwidth with an RGB LCD.
+      // This is the path LVGL takes at color_depth: 16, and it is now the framebuffer's own
+      // format. With big-endian source it is a plain memcpy per row - no per-pixel work at all.
       for (int y = 0; y != ch; y++) {
-        const uint8_t *src = ptr + ((size_t) (y + src_y) * src_stride + src_x) * 2;
+        const uint8_t *src = ptr + ((size_t) (y + src_y) * src_pixels + src_x) * 2;
         uint8_t *dst = this->pixel_ptr_(dst_x, y + dst_y);
-        for (int x = 0; x != cw; x++, src += 2, dst += PIXEL_BYTES) {
-          uint16_t c = big_endian ? (uint16_t) ((src[0] << 8) | src[1]) : (uint16_t) ((src[1] << 8) | src[0]);
-          uint32_t px =
-              pack_pixel(RGB565_LUT.five[(c >> 11) & 0x1F], RGB565_LUT.six[(c >> 5) & 0x3F], RGB565_LUT.five[c & 0x1F]);
-          memcpy(dst, &px, PIXEL_BYTES);
+        if (big_endian) {
+          memcpy(dst, src, (size_t) cw * PIXEL_BYTES);
+        } else {
+          for (int x = 0; x != cw; x++, src += 2, dst += 2) {
+            dst[0] = src[1];
+            dst[1] = src[0];
+          }
         }
       }
       handled = true;
     } else if (bitness == display::COLOR_BITNESS_888 && !big_endian) {
       // COLOR_BITNESS_888 is three bytes per pixel; little-endian RGB puts them in B, G, R
-      // order, which is the framebuffer's own order, so this is a 3 -> 4 byte expansion.
+      // order. Downconvert to 565.
       for (int y = 0; y != ch; y++) {
-        const uint8_t *src = ptr + ((size_t) (y + src_y) * src_stride + src_x) * 3;
+        const uint8_t *src = ptr + ((size_t) (y + src_y) * src_pixels + src_x) * 3;
         uint8_t *dst = this->pixel_ptr_(dst_x, y + dst_y);
-        for (int x = 0; x != cw; x++, src += 3, dst += PIXEL_BYTES) {
-          uint32_t px = (uint32_t) src[0] | ((uint32_t) src[1] << 8) | ((uint32_t) src[2] << 16);
-          memcpy(dst, &px, PIXEL_BYTES);
-        }
+        for (int x = 0; x != cw; x++, src += 3, dst += PIXEL_BYTES)
+          store_pixel(dst, pack_pixel(src[2], src[1], src[0]));
       }
       handled = true;
     }
@@ -422,6 +417,14 @@ void VNCDisplay::accept_client_() {
   if (sock == nullptr)
     return;
   sock->setblocking(false);
+  // Framebuffer updates are latency sensitive and are written in bursts that often end on a
+  // partial segment; Nagle would hold that back waiting for an ACK, adding a round trip to
+  // every screen update. Not fatal if the client or stack refuses it.
+  {
+    int enable = 1;
+    if (sock->setsockopt(IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(int)) != 0)
+      ESP_LOGW(TAG, "Could not set TCP_NODELAY: errno %d", errno);
+  }
   {
     LockGuard guard(this->sock_mutex_);
     this->client_sock_ = std::move(sock);
@@ -570,6 +573,15 @@ bool VNCDisplay::send_framebuffer_(const rect_t &r) {
   this->tx_16(h);
   this->tx_16(0);  // raw encoding
   this->tx_16(0);
+  const bool full_width = (x_start == 0 && w == (size_t) this->width_);
+  if (full_width && h * w * PIXEL_BYTES >= TX_BUF_SIZE) {
+    // Full-width rectangles are contiguous in the framebuffer, so send them directly rather
+    // than copying through the staging buffer. This is the common case for a full refresh.
+    if (!this->tx_flush_())
+      return false;
+    const uint8_t *src = this->display_buffer_ + y_start * this->width_ * PIXEL_BYTES;
+    return this->write_(src, h * w * PIXEL_BYTES) >= 0;
+  }
   for (size_t y = 0; y != h; y++) {
     const uint8_t *src = this->display_buffer_ + ((y + y_start) * this->width_ + x_start) * PIXEL_BYTES;
     size_t remaining = w * PIXEL_BYTES;
@@ -680,17 +692,17 @@ size_t VNCDisplay::build_init_(uint8_t *buffer) {
   uint8_t *sp = buffer;
   sp = put16_be(sp, this->width_);
   sp = put16_be(sp, this->height_);
-  *sp++ = 32;                       // bits per pixel
-  *sp++ = 24;                       // bit depth
-  *sp++ = 0;                        // little-endian
-  *sp++ = 1;                        // true colour
-  sp = put16_be(sp, (1 << 8) - 1);  // red max
-  sp = put16_be(sp, (1 << 8) - 1);  // green max
-  sp = put16_be(sp, (1 << 8) - 1);  // blue max
-  *sp++ = 16;                       // red shift
-  *sp++ = 8;                        // green shift
-  *sp++ = 0;                        // blue shift
-  *sp++ = 0;                        // padding
+  *sp++ = 16;               // bits per pixel
+  *sp++ = 16;               // bit depth
+  *sp++ = 1;                // big-endian
+  *sp++ = 1;                // true colour
+  sp = put16_be(sp, 0x1F);  // red max   (5 bits)
+  sp = put16_be(sp, 0x3F);  // green max (6 bits)
+  sp = put16_be(sp, 0x1F);  // blue max  (5 bits)
+  *sp++ = 11;               // red shift
+  *sp++ = 5;                // green shift
+  *sp++ = 0;                // blue shift
+  *sp++ = 0;                // padding
   *sp++ = 0;
   *sp++ = 0;
   const auto &name = App.get_name();
@@ -720,7 +732,7 @@ bool VNCDisplay::process_() {
     case 0:  // SetPixelFormat
       if (buf_size(this->inq_) >= 20) {
         buf_copy(this->inq_, buffer, 20);
-        if (buffer[4] != 32 || buffer[5] != 24 || buffer[6] != 0 || buffer[7] == 0) {
+        if (buffer[4] != 16 || buffer[6] == 0 || buffer[7] == 0) {
           ESP_LOGW(TAG, "Client requested unsupported pixel format (bits %u, depth %u, %s endian, true colour %s)",
                    buffer[4], buffer[5], buffer[6] ? "big" : "little", buffer[7] ? "yes" : "no");
         }

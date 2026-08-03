@@ -35,9 +35,10 @@
 
 namespace esphome::vnc {
 
-/// Bytes per pixel in the local framebuffer. Stored as B, G, R, X to match the pixel
-/// format advertised in build_init_() (32bpp, little-endian, r<<16 | g<<8 | b).
-static const size_t PIXEL_BYTES = 4;
+/// Bytes per pixel in the local framebuffer. Pixels are stored as big-endian RGB565,
+/// which is exactly the format advertised in build_init_() and exactly what LVGL hands
+/// us at color_depth: 16, so the common flush is a straight memcpy with no conversion.
+static const size_t PIXEL_BYTES = 2;
 /// Size of the client command ring buffer. Must stay 256 so the uint8_t read/write
 /// indices wrap naturally.
 static const size_t RING_SIZE = 256;
@@ -128,6 +129,8 @@ class VNCDisplay : public display::Display {
   int get_height_internal() override { return this->height_; }
   int get_width_internal() override { return this->width_; }
 
+  /// Byte address of a pixel in the framebuffer. Not uint16_t* - rows are not aligned
+  /// for odd widths, and everything here works in bytes anyway.
   inline uint8_t *pixel_ptr_(int x, int y) {
     return this->display_buffer_ + ((size_t) y * this->width_ + x) * PIXEL_BYTES;
   }
