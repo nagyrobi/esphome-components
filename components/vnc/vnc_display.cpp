@@ -399,7 +399,7 @@ void VNCDisplay::start_socket_() {
     this->listen_sock_ = nullptr;
     return;
   }
-  ESP_LOGD(TAG, "Listening on port %u", this->port_);
+  ESP_LOGI(TAG, "VNC listening on port %u", this->port_);
 }
 
 void VNCDisplay::end_socket_() {
@@ -782,7 +782,7 @@ bool VNCDisplay::process_() {
       if (buf_size(this->inq_) >= 8) {
         buf_copy(this->inq_, buffer, 8);
         this->skip_bytes_ = get32_be(buffer + 4);
-        ESP_LOGD(TAG, "Discarding %u byte cut buffer", (unsigned) this->skip_bytes_);
+        ESP_LOGV(TAG, "Discarding %u byte cut buffer", (unsigned) this->skip_bytes_);
         return true;
       }
       break;
