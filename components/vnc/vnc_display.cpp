@@ -29,9 +29,6 @@ static const uint32_t WRITE_TIMEOUT_MS = 2000;
 /// Refuse new connections for this long after a failed password, to slow down guessing.
 static const uint32_t AUTH_RETRY_DELAY_MS = 3000;
 static const size_t CHALLENGE_LEN = 16;
-/// RFB encoding numbers.
-static const int32_t ENCODING_RAW = 0;
-static const int32_t ENCODING_ZLIB = 6;
 
 static const uint8_t RFB_MAGIC[VERSION_LEN] = {
     'R', 'F', 'B', ' ', '0', '0', '3', '.', '0', '0', '3', '\n',
@@ -438,8 +435,6 @@ void VNCDisplay::accept_client_() {
   this->skip_bytes_ = 0;
   this->handshake_have_ = 0;
   this->update_requested_ = false;
-  this->encodings_left_ = 0;
-  this->use_zlib_ = false;
   // Until the client says otherwise it gets what ServerInit advertised.
   static const uint8_t DEFAULT_SPEC[13] = {16, 16, 1, 1, 0, 0x1F, 0, 0x3F, 0, 0x1F, 11, 5, 0};
   this->update_pixel_format_(DEFAULT_SPEC);
@@ -465,12 +460,6 @@ void VNCDisplay::disconnect_() {
   this->skip_bytes_ = 0;
   this->handshake_have_ = 0;
   this->update_requested_ = false;
-  this->encodings_left_ = 0;
-  this->use_zlib_ = false;
-#ifdef USE_VNC_COMPRESSION
-  // The zlib stream is per connection: RFB gives no way to resynchronise a shared one.
-  this->zlib_end_();
-#endif
   this->mark_clean_();
   if (!was_connected)
     return;
@@ -572,124 +561,6 @@ bool VNCDisplay::tx_flush_() {
   return res >= 0;
 }
 
-#ifdef USE_VNC_COMPRESSION
-bool VNCDisplay::zlib_begin_() {
-  if (this->zlib_ready_)
-    return true;
-  memset(&this->zlib_, 0, sizeof(this->zlib_));
-  int err = deflateInit2(&this->zlib_, ZLIB_LEVEL, Z_DEFLATED, ZLIB_WINDOW_BITS, ZLIB_MEM_LEVEL, Z_DEFAULT_STRATEGY);
-  if (err != Z_OK) {
-    ESP_LOGW(TAG, "deflateInit2 failed (%d), falling back to raw encoding", err);
-    return false;
-  }
-  // Deflate can expand incompressible input slightly; deflateBound covers the worst case for
-  // the largest single chunk we ever hand it (one full row, or the whole rect if smaller).
-  this->zlib_out_size_ = deflateBound(&this->zlib_, (size_t) this->width_ * PIXEL_BYTES * 8) + 64;
-  RAMAllocator<uint8_t> allocator;
-  this->zlib_out_ = allocator.allocate(this->zlib_out_size_);
-  if (this->zlib_out_ == nullptr) {
-    ESP_LOGW(TAG, "Could not allocate %u bytes for the compression buffer, falling back to raw encoding",
-             (unsigned) this->zlib_out_size_);
-    deflateEnd(&this->zlib_);
-    this->zlib_out_size_ = 0;
-    return false;
-  }
-  ESP_LOGD(TAG, "zlib encoding active (window %d, memLevel %d, level %d)", ZLIB_WINDOW_BITS, ZLIB_MEM_LEVEL,
-           ZLIB_LEVEL);
-  this->zlib_ready_ = true;
-  return true;
-}
-
-void VNCDisplay::zlib_end_() {
-  if (this->zlib_ready_) {
-    deflateEnd(&this->zlib_);
-    this->zlib_ready_ = false;
-  }
-  RAMAllocator<uint8_t> allocator;
-  if (this->zlib_out_ != nullptr) {
-    allocator.deallocate(this->zlib_out_, this->zlib_out_size_);
-    this->zlib_out_ = nullptr;
-    this->zlib_out_size_ = 0;
-  }
-  if (this->zlib_row_ != nullptr) {
-    allocator.deallocate(this->zlib_row_, this->zlib_row_size_);
-    this->zlib_row_ = nullptr;
-    this->zlib_row_size_ = 0;
-  }
-}
-
-/// Send one rectangle using encoding 6: a four byte big-endian length, then the deflate stream.
-/// The length is only known after compressing, so the rows are deflated first into a count, then
-/// written - which means holding the compressed bytes. Instead we compress row by row and buffer
-/// the output, which for realistic rectangles is far smaller than the raw pixels.
-bool VNCDisplay::send_framebuffer_zlib_(const rect_t &r, size_t x_start, size_t y_start, size_t w, size_t h) {
-  const size_t wire = this->wire_bytes_();
-  const bool native = this->client_format_.native;
-  if (!native) {
-    size_t need = w * wire;
-    if (this->zlib_row_size_ < need) {
-      RAMAllocator<uint8_t> allocator;
-      if (this->zlib_row_ != nullptr)
-        allocator.deallocate(this->zlib_row_, this->zlib_row_size_);
-      this->zlib_row_ = allocator.allocate(need);
-      this->zlib_row_size_ = this->zlib_row_ == nullptr ? 0 : need;
-      if (this->zlib_row_ == nullptr) {
-        ESP_LOGW(TAG, "Could not allocate a conversion row, falling back to raw encoding");
-        this->use_zlib_ = false;
-        return this->send_framebuffer_(r);
-      }
-    }
-  }
-
-  // Collect the whole compressed rectangle first so its length can be written up front.
-  std::vector<uint8_t> compressed;
-  compressed.reserve(w * h * wire / 8 + 128);
-  this->zlib_.next_in = nullptr;
-  this->zlib_.avail_in = 0;
-  for (size_t y = 0; y != h; y++) {
-    const uint8_t *src = this->display_buffer_ + ((y + y_start) * this->width_ + x_start) * PIXEL_BYTES;
-    const uint8_t *row;
-    if (native) {
-      row = src;
-    } else {
-      this->convert_row_(src, this->zlib_row_, w);
-      row = this->zlib_row_;
-    }
-    this->zlib_.next_in = const_cast<Bytef *>(row);
-    this->zlib_.avail_in = w * wire;
-    const bool last_row = (y + 1 == h);
-    do {
-      this->zlib_.next_out = this->zlib_out_;
-      this->zlib_.avail_out = this->zlib_out_size_;
-      int err = deflate(&this->zlib_, last_row ? Z_SYNC_FLUSH : Z_NO_FLUSH);
-      if (err != Z_OK && err != Z_BUF_ERROR) {
-        ESP_LOGW(TAG, "deflate failed (%d), dropping client", err);
-        this->disconnect_pending_ = true;
-        return false;
-      }
-      size_t produced = this->zlib_out_size_ - this->zlib_.avail_out;
-      compressed.insert(compressed.end(), this->zlib_out_, this->zlib_out_ + produced);
-    } while (this->zlib_.avail_in != 0 || (last_row && this->zlib_.avail_out == 0));
-  }
-
-  if (this->tx_rem_() < 16 && !this->tx_flush_())
-    return false;
-  this->tx_16(x_start);
-  this->tx_16(y_start);
-  this->tx_16(w);
-  this->tx_16(h);
-  this->tx_16((uint16_t) (ENCODING_ZLIB >> 16));
-  this->tx_16((uint16_t) ENCODING_ZLIB);
-  put32_be(this->tx_buf_ + this->tx_buflen_, compressed.size());
-  this->tx_buflen_ += 4;
-  if (!this->tx_flush_())
-    return false;
-  ESP_LOGV(TAG, "Send zlib %u/%u %ux%u: %u -> %u bytes", (unsigned) x_start, (unsigned) y_start, (unsigned) w,
-           (unsigned) h, (unsigned) (w * h * wire), (unsigned) compressed.size());
-  return this->write_(compressed.data(), compressed.size()) >= 0;
-}
-#endif  // USE_VNC_COMPRESSION
-
 /// Convert one framebuffer row into the client's pixel format.
 void VNCDisplay::convert_row_(const uint8_t *src, uint8_t *dst, size_t count) {
   const auto &f = this->client_format_;
@@ -716,10 +587,6 @@ bool VNCDisplay::send_framebuffer_(const rect_t &r) {
   size_t w = r.x_max - r.x_min + 1;
   size_t h = r.y_max - r.y_min + 1;
   const size_t wire = this->wire_bytes_();
-#ifdef USE_VNC_COMPRESSION
-  if (this->use_zlib_ && this->zlib_ready_)
-    return this->send_framebuffer_zlib_(r, x_start, y_start, w, h);
-#endif
   ESP_LOGV(TAG, "Send framebuffer %u/%u %ux%u", (unsigned) x_start, (unsigned) y_start, (unsigned) w, (unsigned) h);
   if (this->tx_rem_() < 12 && !this->tx_flush_())
     return false;
@@ -926,29 +793,6 @@ bool VNCDisplay::process_() {
   uint8_t buffer[32];
   size_t len;
 
-  // Consume any outstanding SetEncodings list, noting the ones we can act on.
-  while (this->encodings_left_ != 0 && buf_size(this->inq_) >= 4) {
-    buf_copy(this->inq_, buffer, 4);
-    int32_t enc = (int32_t) get32_be(buffer);
-    this->encodings_left_--;
-#ifdef USE_VNC_COMPRESSION
-    if (enc == ENCODING_ZLIB && this->compression_enabled_)
-      this->use_zlib_ = true;
-#else
-    (void) enc;
-#endif
-    if (this->encodings_left_ == 0) {
-#ifdef USE_VNC_COMPRESSION
-      if (this->use_zlib_ && !this->zlib_begin_())
-        this->use_zlib_ = false;
-#endif
-      ESP_LOGD(TAG, "Using %s encoding", this->use_zlib_ ? "zlib" : "raw");
-    }
-    return true;
-  }
-  if (this->encodings_left_ != 0)
-    return false;  // wait for the rest of the list before reading the next message
-
   if (this->skip_bytes_ != 0) {
     size_t skip = std::min(buf_size(this->inq_), this->skip_bytes_);
     buf_skip(this->inq_, skip);
@@ -973,10 +817,9 @@ bool VNCDisplay::process_() {
       if (buf_size(this->inq_) >= 4) {
         buf_copy(this->inq_, buffer, 4);
         len = get16_be(buffer + 2);
-        // The list can be far larger than the ring buffer, so it is consumed four bytes at a
-        // time as it arrives rather than buffered whole; see the loop at the top of process_().
-        this->encodings_left_ = len;
-        this->use_zlib_ = false;
+        // Only raw encoding is implemented, so the list is discarded rather than buffered -
+        // it can be far larger than the ring buffer.
+        this->skip_bytes_ = len * 4;
         ESP_LOGD(TAG, "Client offered %u encodings", (unsigned) len);
         return true;
       }
