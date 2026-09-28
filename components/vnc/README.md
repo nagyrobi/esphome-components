@@ -100,11 +100,6 @@ display:
   VNC port, which most clients assume when you give them a bare IP address. Use a different port if
   you run more than one VNC display on the same device.
 
-- **`compression`** (*Optional*, boolean, default `false`) — offer zlib compression (RFB encoding
-  6). Only used if the client also asks for it; otherwise the connection stays on raw encoding.
-  Costs about 25 KB of flash and 30 KB of RAM per connection, so it is compiled out entirely
-  unless enabled. See [Memory and bandwidth](#memory-and-bandwidth).
-
 - **`password`** (*Optional*, string) — enables VNC authentication. 1–8 ASCII characters; longer or
   non-ASCII values are rejected at compile time. Omit it entirely for no authentication, which is the
   default. See [Authentication](#authentication).
@@ -272,21 +267,9 @@ error naming the size it wanted and marks itself failed, so a missing `psram:` b
 immediately rather than as a mystery crash. On top of that it uses a fixed 4 KiB staging buffer and a
 1.6 KiB rectangle queue in internal RAM.
 
-Wire traffic without `compression:` is the same 2 bytes per pixel: a full 480×480 refresh is 450 KiB.
-Only changed rectangles are sent, so a UI with a few updating labels costs very little; something
-animating the whole screen costs a lot.
-
-With `compression: true` and a client that requests zlib, typical dashboard content compresses
-dramatically — measured on a representative 480×480 UI frame, a full refresh drops from 450 KiB to
-around 4 KiB, and a small label-sized rectangle from 26 KB to a few hundred bytes. Ratios depend
-entirely on content: flat panels and text compress enormously, photographic images and dithered
-gradients much less.
-
-The cost is roughly 25 KB of flash, plus a 30 KB deflate state allocated when a client negotiates
-zlib and freed when it disconnects. Compression runs on the transmit task, not the main loop.
-Deflate is not free on an ESP32 — expect tens of milliseconds for a full-screen frame — but it
-trades CPU for a large reduction in both PSRAM traffic and Wi-Fi airtime, which is usually the
-better deal on a device that also drives a physical panel.
+Wire traffic is the same 2 bytes per pixel, uncompressed — only raw encoding is implemented. A full
+480×480 refresh is 450 KiB. Only changed rectangles are sent, so a UI with a few updating labels
+costs very little; something animating the whole screen costs a lot.
 
 **If your device also drives an RGB parallel panel** (ST7701S and friends on an ESP32-S3), be aware
 that the VNC framebuffer and the panel's scan-out share PSRAM bandwidth. A connected client streaming
@@ -305,9 +288,7 @@ Set `logger: level: DEBUG` to see the session lifecycle.
 | `Client connected` | TCP connection accepted; handshake starting. |
 | `Client authenticated` | Correct password. Only with `password:` set. |
 | `Authentication failed, dropping client` | Wrong password. New connections refused for 3 s. |
-| `Client offered N encodings` | Normal — the list the client supports. |
-| `Using raw encoding` / `Using zlib encoding` | Debug-level. Which encoding was negotiated. |
-| `zlib encoding active (window …)` | Debug-level. The deflate state was allocated successfully. |
+| `Client offered N encodings` | Normal. Only raw encoding is implemented, so the list is ignored. |
 | `Connection closed by peer while writing (errno 104)` | Debug-level, and **normal**. A client that closes while frames are in flight still has unread data buffered, and TCP requires it to answer with a reset. Only an idle client produces a clean close. |
 | `Client disconnected` | Session over, resources released. |
 | `Client pixel format: … ` | Debug-level. The format the client asked for; `(native)` means no conversion is needed. |
@@ -318,7 +299,7 @@ Set `logger: level: DEBUG` to see the session lifecycle.
 ## Limitations
 
 - **One client at a time.**
-- **Raw and zlib encodings only** — no Tight, ZRLE, Hextile or CopyRect. zlib is off by default; see `compression:`.
+- **Raw encoding only** — no compression. Simple and low-CPU, but bandwidth-hungry.
 - **RFB protocol 3.3.** Fine for every common client (Remmina, TigerVNC, RealVNC, TightVNC,
   macOS Screen Sharing).
 - **No keyboard input.** Key events are received and logged at verbose level, but not delivered

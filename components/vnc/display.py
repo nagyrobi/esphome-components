@@ -3,7 +3,6 @@ import esphome.codegen as cg
 from esphome.components import display
 import esphome.config_validation as cv
 from esphome.const import (
-    CONF_COMPRESSION,
     CONF_DIMENSIONS,
     CONF_HEIGHT,
     CONF_ID,
@@ -65,7 +64,6 @@ CONFIG_SCHEMA = cv.All(
             cv.GenerateID(): cv.declare_id(VNCDisplay),
             cv.Optional(CONF_PORT, default=5900): cv.port,
             cv.Optional(CONF_PASSWORD): cv.sensitive(_validate_password),
-            cv.Optional(CONF_COMPRESSION, default=False): cv.boolean,
             cv.Required(CONF_DIMENSIONS): cv.Any(
                 cv.dimensions,
                 cv.Schema(
@@ -110,13 +108,6 @@ async def to_code(config):
     cg.add(var.set_port(config[CONF_PORT]))
     if (password := config.get(CONF_PASSWORD)) is not None:
         cg.add(var.set_password(password))
-
-    if config[CONF_COMPRESSION]:
-        # Deflate state is ~30 KiB per connection plus ~25 KiB of flash, so the whole
-        # implementation is compiled out unless it is actually asked for.
-        cg.add_define("USE_VNC_COMPRESSION")
-        cg.add_library("zlib", None)
-        cg.add(var.set_compression(True))
 
     if lambconf := config.get(CONF_LAMBDA):
         lambda_ = await cg.process_lambda(
